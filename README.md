@@ -1,10 +1,10 @@
 # MEDC17 Checksum Tool
 
-Professional checksum analyzer and corrector for Bosch MED17/EDC17 ECU firmware binaries.
+Checksum analyzer and corrector for Bosch MED17/EDC17 ECU firmware binaries.
 
 ## Overview
 
-Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Supports CRC32, ADD32, and ADD16 algorithms with instant mathematical solving—no brute force required.
+Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Supports CRC32, ADD32, and ADD16 algorithms.
 
 > [!WARNING]
 > Currently tested primarily with calibration changes. Code section modifications may require additional validation.
@@ -92,8 +92,8 @@ Traditional methods brute-force billions of values. This tool models CRC32 as 32
 
 Future enhancements planned:
 
-- [ ] **Sync blocks** - Handle synchronized block checksums
-- [ ] **ECM/Code monitoring checksums** - Support for runtime checksum validation
+- [ ] **Sync blocks** - WinOLS references these, what are they??
+- [ ] **ECM/Code monitoring checksums** - Make sure all monitoring checksums are corrected
 - [ ] **CVN (Calibration Verification Number) fixing**
 - [ ] **Extended testing** - Validation with code section modifications beyond calibration changes
 
