@@ -7,7 +7,7 @@ Checksum analyzer and corrector for Bosch MED17/EDC17 ECU firmware binaries.
 Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Supports CRC32, ADD32, and ADD16 algorithms.
 
 > [!WARNING]
-> Currently tested primarily with calibration changes. Code section modifications may require additional validation.
+> Currently tested primarily with calibration changes. Code section modifications may require additional validation. ECUs utilising the "Variant Dataset" may not currently be properly corrected by this tool.
 
 ## Features
 
@@ -15,6 +15,7 @@ Analyzes and corrects checksums in Bosch MED17 and EDC17 ECU firmware files. Sup
 - ✅ **Three algorithms** - CRC32, ADD32, and ADD16 support
 - ✅ **Instant CRC32 solving** - GF(2) matrix algebra
 - ✅ **RSA signature forging** - Generates valid Bleichenbacher signatures
+- ✅ **CVN correction** - Fix Calibration Verification Number to match original
 - ✅ **Safe operation** - Never overwrites original files
 
 ---
@@ -56,11 +57,17 @@ python main.py firmware.bin
 python main.py firmware.bin --correct --output firmware_corrected.bin
 ```
 
+### Correct checksums and CVN
+```bash
+python main.py modified.bin --correct --fix-cvn original.bin --output fixed.bin
+```
+
 ### Options
 ```
   -h, --help            Show help
   -c, --correct         Correct invalid checksums
   -o OUTPUT, --output   Output file path for corrected binary
+  --fix-cvn ORIGINAL    Fix CVN to match the CVN from ORIGINAL file
 ```
 
 ## How It Works
@@ -80,6 +87,22 @@ ECU firmware contains multiple Bosch blocks with checksums protecting different 
 ### CRC32 Mathematical Solving
 Traditional methods brute-force billions of values. This tool models CRC32 as 32 linear equations over GF(2), constructs a 32×32 matrix, and solves using Gaussian elimination.
 
+### CVN (Calibration Verification Number)
+The CVN is a CRC32 checksum over specific memory regions that OBD-II diagnostics report to verify calibration integrity. When modifying calibration data, the CVN changes and will no longer match dealer records.
+
+**How CVN correction works:**
+
+Instead of hardcoding regions per ECU variant, this tool dynamically discovers the CVN configuration structure directly from the binary:
+
+1. **Structure Discovery** - Locates the CVN config by scanning for patterns (we always know that DS0 will appear in the main struct)
+2. **Region Extraction** - Reads the actual memory regions from the structure (typically ASW + Dataset areas, but this can vary by ECU)
+3. **Patch Location** - Calculates an optimal patch point within the CVN range but outside checksum-critical areas
+4. **GF(2) Solving** - Uses matrix algebra to find a 4-byte patch value that produces the target CVN
+
+This approach works across different MED17/EDC17 variants without requiring variant-specific configuration.
+
+**Future enhancement:** A CSV database of software version numbers and their corresponding CVN values could eliminate the need for the original binary file entirely.
+
 ## Technical Details
 
 | Algorithm | Initial Value | Expected Result | Method |
@@ -94,7 +117,7 @@ Future enhancements planned:
 
 - [ ] **Sync blocks** - WinOLS references these, what are they??
 - [ ] **ECM/Code monitoring checksums** - Make sure all monitoring checksums are corrected
-- [ ] **CVN (Calibration Verification Number) fixing**
+- [ ] **Variant Dataset Correction** - Even with just calibration changes WinOLS will make changes to the VDS block epilog if it exists, needs investigation
 - [ ] **Extended testing** - Validation with code section modifications beyond calibration changes
 
 Contributions welcome!

@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
-MEDC17 Checksum Tool v1.0
+MEDC17 Checksum Tool v1.1
 
 Professional checksum analyzer and corrector for MEDC17 ECU binaries.
 Supports CRC32, ADD32, and ADD16 algorithms with mathematical GF(2) solving.
+Includes CVN (Calibration Verification Number) calculation and correction.
+
+I am aware this is an unholy amount of lines of code, I will probably separate this out in the future; or not (probably not)
+This could probably be massively simplified, and will likely draw critique; but last I checked there's no other open source checksum correction tools for these ECUs 🤷‍♂️
 
 Copyright (c) 2025 Connor Howell
 Licensed under the MIT License
@@ -31,12 +35,12 @@ def print_banner():
     """Display tool banner with version info."""
     banner_text = """
 ================================================================
-          MEDC17 Checksum Analyzer & Corrector v1.0
+          MEDC17 Checksum Analyzer & Corrector v1.1
 ================================================================
     """
     console.print(banner_text, style="bold cyan")
     console.print("Advanced checksum tool for Bosch MED/EDC17 ECU binaries", style="dim")
-    console.print("Supports: CRC32 (GF(2) solver), ADD32, ADD16\n", style="dim")
+    console.print("Supports: CRC32 (GF(2) solver), ADD32, ADD16, CVN\n", style="dim")
 
 
 def print_success(message: str):
@@ -385,6 +389,17 @@ class ChecksumStructure:
 
 
 @dataclass
+class CVNConfig:
+    """CVN (Calibration Verification Number) configuration"""
+    config_offset: int  # File offset of the config structure
+    regions: List[tuple]  # List of (start, end) memory addresses
+    ds_start: int  # Dataset start memory address
+    ds_wocs_end: int  # Dataset WOCS (without checksum) end memory address
+    base_address: int  # Memory base address (for file offset conversion)
+    calculated_cvn: Optional[int] = None
+
+
+@dataclass
 class BoschBlock:
     """Represents a Bosch checksum block"""
     bin_start: int
@@ -412,6 +427,7 @@ class MEDC17BinaryParser:
         self.binary_path = Path(binary_path)
         self.data: bytes = b''
         self.bosch_blocks: List[BoschBlock] = []
+        self.cvn_config: Optional[CVNConfig] = None
 
     def load_binary(self) -> None:
         """Load binary file into memory"""
@@ -541,6 +557,9 @@ class MEDC17BinaryParser:
     def find_bosch_blocks(self) -> None:
         """Find all Bosch blocks by scanning for non-zero bytes after padding"""
         print("\n[*] Scanning for Bosch checksum blocks...")
+
+        # Clear existing blocks before re-scanning
+        self.bosch_blocks = []
 
         # Find first block (first non-zero byte)
         current_pos = self.find_next_nonzero(0)
@@ -798,6 +817,389 @@ class MEDC17BinaryParser:
 
         print(f"[+] Validated {valid}/{total} checksums")
 
+    def _is_flash_addr(self, addr: int) -> bool:
+        """Check if address is a valid TriCore flash address."""
+        return 0x80000000 <= addr <= 0x807FFFFF
+
+    def find_cvn_config(self) -> Optional[CVNConfig]:
+        """
+        Find and parse the CVN configuration from the binary.
+
+        The CVN config structure contains pointers to memory regions used
+        for calculating the Calibration Verification Number (CRC32).
+
+        Returns:
+            CVNConfig if found, None otherwise
+        """
+        # Find dataset block (0x60)
+        ds_block = None
+        for block in self.bosch_blocks:
+            if block.block_identifier == 0x60:
+                ds_block = block
+                break
+
+        if not ds_block:
+            return None
+
+        ds_start = ds_block.block_start
+        ds_end = ds_block.block_end
+        base = self.bosch_blocks[0].block_start - self.bosch_blocks[0].bin_start
+
+        # Search for CVN config pattern:
+        # { pointer, DS_START, DS_WOCS_END, count }
+        for offset in range(0, len(self.data) - 16, 4):
+            ptr = self.read_dword_le(offset)
+            val1 = self.read_dword_le(offset + 4)
+            val2 = self.read_dword_le(offset + 8)
+            count = self.read_dword_le(offset + 12)
+
+            # Check pattern: ptr is flash addr, val1 is DS start,
+            # val2 is within DS range, count is small
+            if (self._is_flash_addr(ptr) and val1 == ds_start and
+                self._is_flash_addr(val2) and ds_start < val2 <= ds_end and
+                1 <= count <= 4):
+
+                # Follow pointer to get memory section table
+                config_offset = ptr - base
+                if not (0 <= config_offset < len(self.data)):
+                    continue
+
+                memsec_ptr = self.read_dword_le(config_offset)
+                memsec_offset = memsec_ptr - base
+                if not (0 <= memsec_offset < len(self.data)):
+                    continue
+
+                # Read memory section entries (start, end pairs)
+                regions = []
+                for i in range(4):  # Max 4 sections
+                    sec_start = self.read_dword_le(memsec_offset + i * 8)
+                    sec_end = self.read_dword_le(memsec_offset + i * 8 + 4)
+                    if self._is_flash_addr(sec_start) and self._is_flash_addr(sec_end) and sec_end > sec_start:
+                        regions.append((sec_start, sec_end))
+                    else:
+                        break
+
+                # Add dataset region
+                regions.append((val1, val2))
+
+                return CVNConfig(
+                    config_offset=offset,
+                    regions=regions,
+                    ds_start=val1,
+                    ds_wocs_end=val2,
+                    base_address=base
+                )
+
+        return None
+
+    def calculate_cvn(self, data: bytes = None) -> Optional[int]:
+        """
+        Calculate CVN (Calibration Verification Number) using CRC32.
+
+        The CVN is a CRC32 checksum over specific memory regions defined
+        in the CVN configuration.
+
+        Uses a pre-computed lookup table for fast byte-at-a-time processing.
+        Processes data as little-endian dwords (4 bytes at a time) to match
+        the original TriCore MCU implementation.
+
+        Args:
+            data: Optional data to use (defaults to self.data)
+
+        Returns:
+            32-bit CVN value, or None if CVN config not found
+        """
+        if self.cvn_config is None:
+            return None
+
+        if data is None:
+            data = self.data
+
+        # Initialize lookup table if needed
+        init_crc32_table()
+
+        crc = 0xFFFFFFFF
+        base = self.cvn_config.base_address
+
+        for mem_start, mem_end in self.cvn_config.regions:
+            file_start = mem_start - base
+            file_end = mem_end - base
+
+            if file_start < 0 or file_end > len(data):
+                continue
+
+            # Process 4 bytes at a time (little-endian dword) using lookup table
+            # This matches the original bit-by-bit implementation but is ~8x faster
+            pos = file_start
+            while pos + 3 <= file_end:
+                # Process all 4 bytes of the dword through the CRC
+                # In little-endian: byte0, byte1, byte2, byte3
+                crc = CRC32_TABLE[(crc ^ data[pos]) & 0xFF] ^ (crc >> 8)
+                crc = CRC32_TABLE[(crc ^ data[pos+1]) & 0xFF] ^ (crc >> 8)
+                crc = CRC32_TABLE[(crc ^ data[pos+2]) & 0xFF] ^ (crc >> 8)
+                crc = CRC32_TABLE[(crc ^ data[pos+3]) & 0xFF] ^ (crc >> 8)
+                pos += 4
+
+        return crc ^ 0xFFFFFFFF
+
+    def correct_cvn(self, target_cvn: int, data: bytearray) -> bool:
+        """
+        Correct CVN to match a target value by patching the dataset region.
+
+        Uses GF(2) matrix solving to find a 4-byte patch value that makes
+        the CVN CRC32 equal the target value.
+
+        The patch location is: DS_WOCS_END aligned down to 32-byte boundary
+
+        Args:
+            target_cvn: Target CVN value to achieve
+            data: Mutable binary data (bytearray)
+
+        Returns:
+            True if correction successful, False otherwise
+        """
+        if self.cvn_config is None:
+            return False
+
+        base = self.cvn_config.base_address
+        ds_wocs_end_file = self.cvn_config.ds_wocs_end - base
+
+        # Patch location: DS_WOCS_END aligned down to 32-byte boundary
+        patch_offset = ds_wocs_end_file & ~0x1F
+
+        # Verify patch is within a CVN region
+        patch_in_region = False
+        for mem_start, mem_end in self.cvn_config.regions:
+            file_start = mem_start - base
+            file_end = mem_end - base
+            if file_start <= patch_offset < file_end:
+                patch_in_region = True
+                break
+
+        if not patch_in_region:
+            print_error("CVN patch location not within any CVN region")
+            return False
+
+        # Use multi-region solver which handles all cases correctly
+        return self._correct_cvn_multiregion(target_cvn, data, patch_offset)
+
+    def _correct_cvn_multiregion(self, target_cvn: int, data: bytearray, patch_offset: int) -> bool:
+        """
+        Correct CVN when patch is in a multi-region calculation.
+
+        Uses GF(2) matrix solving with O(n + log(n)*32^3) complexity:
+        1. Calculate CVN with patch=0 (single pass through data)
+        2. Compute CRC up to patch point (partial pass, reuses work)
+        3. Build local transformation matrix (32 single-dword calculations)
+        4. Use matrix exponentiation to propagate effects through remaining data
+
+        This is much faster than computing CVN 33 times.
+        """
+        init_crc32_table()
+        base = self.cvn_config.base_address
+
+        # Find which region contains the patch
+        patch_region_idx = None
+        for idx, (mem_start, mem_end) in enumerate(self.cvn_config.regions):
+            file_start = mem_start - base
+            file_end = mem_end - base
+            if file_start <= patch_offset < file_end:
+                patch_region_idx = idx
+                break
+
+        if patch_region_idx is None:
+            return False
+
+        patch_region_file_start = self.cvn_config.regions[patch_region_idx][0] - base
+        patch_region_file_end = self.cvn_config.regions[patch_region_idx][1] - base
+
+        # Calculate CVN with patch=0 (needed for final answer)
+        data_copy = bytearray(data)
+        struct.pack_into('<I', data_copy, patch_offset, 0)
+        cvn_with_zero = self.calculate_cvn(bytes(data_copy))
+
+        # Calculate CRC up to (but not including) the patch dword
+        crc_to_patch = 0xFFFFFFFF
+
+        # Process all regions before patch region
+        for idx in range(patch_region_idx):
+            mem_start, mem_end = self.cvn_config.regions[idx]
+            file_start = mem_start - base
+            file_end = mem_end - base
+            if file_start < 0 or file_end > len(data):
+                continue
+            pos = file_start
+            while pos + 3 <= file_end:
+                crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos]) & 0xFF] ^ (crc_to_patch >> 8)
+                crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+1]) & 0xFF] ^ (crc_to_patch >> 8)
+                crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+2]) & 0xFF] ^ (crc_to_patch >> 8)
+                crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+3]) & 0xFF] ^ (crc_to_patch >> 8)
+                pos += 4
+
+        # Process patch region up to patch offset
+        pos = patch_region_file_start
+        while pos < patch_offset:
+            crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos]) & 0xFF] ^ (crc_to_patch >> 8)
+            crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+1]) & 0xFF] ^ (crc_to_patch >> 8)
+            crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+2]) & 0xFF] ^ (crc_to_patch >> 8)
+            crc_to_patch = CRC32_TABLE[(crc_to_patch ^ data[pos+3]) & 0xFF] ^ (crc_to_patch >> 8)
+            pos += 4
+
+        # Build local transformation: effect of each patch bit on CRC after patch dword
+        def process_dword_table(crc_in, b0, b1, b2, b3):
+            crc = crc_in
+            crc = CRC32_TABLE[(crc ^ b0) & 0xFF] ^ (crc >> 8)
+            crc = CRC32_TABLE[(crc ^ b1) & 0xFF] ^ (crc >> 8)
+            crc = CRC32_TABLE[(crc ^ b2) & 0xFF] ^ (crc >> 8)
+            crc = CRC32_TABLE[(crc ^ b3) & 0xFF] ^ (crc >> 8)
+            return crc
+
+        baseline_crc = process_dword_table(crc_to_patch, 0, 0, 0, 0)
+        patch_effects_local = []
+        for bit in range(32):
+            patch_val = 1 << bit
+            b0 = patch_val & 0xFF
+            b1 = (patch_val >> 8) & 0xFF
+            b2 = (patch_val >> 16) & 0xFF
+            b3 = (patch_val >> 24) & 0xFF
+            test_crc = process_dword_table(crc_to_patch, b0, b1, b2, b3)
+            patch_effects_local.append(test_crc ^ baseline_crc)
+
+        # Count total CRC bytes after patch (each byte = 1 step through table)
+        # The CVN loop uses "while pos + 3 <= file_end", so we need to count
+        # how many complete dwords can be processed from patch_offset+4 to file_end
+        total_bytes_after = 0
+
+        # Remaining in patch region: count dwords that fit in [patch_offset+4, patch_region_file_end]
+        pos = patch_offset + 4
+        while pos + 3 <= patch_region_file_end:
+            total_bytes_after += 4
+            pos += 4
+
+        # Additional regions
+        for idx in range(patch_region_idx + 1, len(self.cvn_config.regions)):
+            mem_start, mem_end = self.cvn_config.regions[idx]
+            file_start = mem_start - base
+            file_end = mem_end - base
+            if file_start >= 0 and file_end <= len(data):
+                pos = file_start
+                while pos + 3 <= file_end:
+                    total_bytes_after += 4
+                    pos += 4
+
+        # Build propagation matrix using matrix exponentiation
+        # Single-step matrix: how CRC difference propagates through one table lookup
+        # For table CRC: crc_out = TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
+        # Difference propagation: d_out = TABLE[d & 0xFF] ^ (d >> 8) when byte is same
+        # This is because: (crc1 ^ byte) ^ (crc2 ^ byte) = crc1 ^ crc2 = d
+        def diff_step_table(d):
+            """Propagate CRC difference through one byte/table step."""
+            return CRC32_TABLE[d & 0xFF] ^ (d >> 8)
+
+        # Build single-step matrix
+        step_matrix = [diff_step_table(1 << i) for i in range(32)]
+
+        # Matrix operations in GF(2)
+        def matrix_mult_gf2(A, B):
+            result = []
+            for i in range(32):
+                row = 0
+                for j in range(32):
+                    val = 0
+                    for k in range(32):
+                        if ((A[i] >> k) & 1) and ((B[k] >> j) & 1):
+                            val ^= 1
+                    row |= (val << j)
+                result.append(row)
+            return result
+
+        def matrix_pow_gf2(M, n):
+            if n == 0:
+                return [1 << i for i in range(32)]
+            result = [1 << i for i in range(32)]
+            base = M[:]
+            while n > 0:
+                if n & 1:
+                    result = matrix_mult_gf2(result, base)
+                base = matrix_mult_gf2(base, base)
+                n >>= 1
+            return result
+
+        def apply_matrix(matrix, vec):
+            result = 0
+            for out_bit in range(32):
+                val = 0
+                for in_bit in range(32):
+                    if ((matrix[in_bit] >> out_bit) & 1) and ((vec >> in_bit) & 1):
+                        val ^= 1
+                result |= (val << out_bit)
+            return result
+
+        # Compute propagation matrix for all bytes after patch
+        prop_matrix = matrix_pow_gf2(step_matrix, total_bytes_after)
+
+        # Apply propagation to get final effects on CVN
+        patch_effects = []
+        for bit in range(32):
+            final_effect = apply_matrix(prop_matrix, patch_effects_local[bit])
+            patch_effects.append(final_effect)
+
+        target_diff = target_cvn ^ cvn_with_zero
+
+        # Build augmented matrix for Gaussian elimination
+        # Each row corresponds to an output bit
+        aug_matrix = []
+        for out_bit in range(32):
+            row = 0
+            for in_bit in range(32):
+                if (patch_effects[in_bit] >> out_bit) & 1:
+                    row |= (1 << in_bit)
+            target_bit = (target_diff >> out_bit) & 1
+            aug_matrix.append([row, target_bit])
+
+        # Gaussian elimination in GF(2)
+        for col in range(32):
+            # Find pivot
+            pivot_row = None
+            for row in range(col, 32):
+                if (aug_matrix[row][0] >> col) & 1:
+                    pivot_row = row
+                    break
+
+            if pivot_row is None:
+                continue
+
+            # Swap
+            if pivot_row != col:
+                aug_matrix[col], aug_matrix[pivot_row] = aug_matrix[pivot_row], aug_matrix[col]
+
+            # Eliminate
+            for row in range(32):
+                if row != col and ((aug_matrix[row][0] >> col) & 1):
+                    aug_matrix[row][0] ^= aug_matrix[col][0]
+                    aug_matrix[row][1] ^= aug_matrix[col][1]
+
+        # Extract solution
+        patch_value = 0
+        for row in range(32):
+            row_matrix = aug_matrix[row][0]
+            target_bit = aug_matrix[row][1]
+            if row_matrix == 0:
+                if target_bit != 0:
+                    return False  # No solution exists
+                continue
+            for col in range(32):
+                if (row_matrix >> col) & 1:
+                    if target_bit:
+                        patch_value |= (1 << col)
+                    break
+
+        # Write and verify
+        struct.pack_into('<I', data, patch_offset, patch_value)
+        new_cvn = self.calculate_cvn(bytes(data))
+
+        return new_cvn == target_cvn
+
     def correct_add32_checksum(self, cs: ChecksumStructure, block_start_mem: int,
                                 block_start_bin: int, data: bytearray) -> bool:
         """
@@ -950,16 +1352,14 @@ class MEDC17BinaryParser:
         data[signature_offset:signature_offset+128] = forged_signature
 
         # Solve for dCSAdjust value using GF(2) matrix algebra (instant!)
-        with Progress(SpinnerColumn(), TextColumn("[blue]Solving CRC32..."), console=console) as progress:
-            progress.add_task("solve", total=None)
-            patch_value = solve_crc32_patch_matrix(
-                bytes(data),
-                start_offset,
-                end_offset,
-                epilog_adjust_offset,
-                cs.cs_start_val,
-                target_checksum
-            )
+        patch_value = solve_crc32_patch_matrix(
+            bytes(data),
+            start_offset,
+            end_offset,
+            epilog_adjust_offset,
+            cs.cs_start_val,
+            target_checksum
+        )
 
         if patch_value is not None:
             # Write and verify
@@ -1087,19 +1487,22 @@ class MEDC17BinaryParser:
 
         # Write corrected binary if requested
         console.print()
-        if output_path and corrected_count > 0:
+        if output_path:
             with open(output_path, 'wb') as f:
                 f.write(corrected_data)
 
-            console.print(Panel(
-                f"[green]✓[/green] Corrected binary saved to:\n[cyan]{output_path}[/cyan]\n\n" +
-                f"[bold]Checksums corrected:[/bold] {corrected_count}",
-                title="💾 Success",
-                border_style="green"
-            ))
+            if corrected_count > 0:
+                console.print(Panel(
+                    f"[green]✓[/green] Corrected binary saved to:\n[cyan]{output_path}[/cyan]\n\n" +
+                    f"[bold]Checksums corrected:[/bold] {corrected_count}",
+                    title="💾 Success",
+                    border_style="green"
+                ))
+            else:
+                print_info("All checksums already valid - no corrections needed")
         elif corrected_count > 0:
             print_warning("Corrections made but not saved (specify output path)")
-        elif corrected_count == 0:
+        else:
             print_info("All checksums already valid - no corrections needed")
 
         return corrected_count
@@ -1117,7 +1520,13 @@ class MEDC17BinaryParser:
         variants = self.identify_ecu_variant()
         if variants:
             variant_text = "\n".join(f"• {v}" for v in variants)
-            console.print(Panel(variant_text, title="🔧 ECU Variant", border_style="blue"))
+            console.print(Panel(variant_text, title="ECU Variant", border_style="blue"))
+
+        # CVN Info
+        if self.cvn_config and self.cvn_config.calculated_cvn is not None:
+            cvn_text = f"[bold]CVN:[/bold] 0x{self.cvn_config.calculated_cvn:08X}\n"
+            cvn_text += f"[dim]Regions: {len(self.cvn_config.regions)}[/dim]"
+            console.print(Panel(cvn_text, title="CVN (Calibration Verification Number)", border_style="magenta"))
 
         # Bosch Blocks summary
         console.print()
@@ -1184,6 +1593,13 @@ class MEDC17BinaryParser:
         self.load_binary()
         self.find_bosch_blocks()
         self.validate_all_checksums()
+
+        # Find and calculate CVN
+        self.cvn_config = self.find_cvn_config()
+        if self.cvn_config:
+            self.cvn_config.calculated_cvn = self.calculate_cvn()
+            print(f"[+] CVN: 0x{self.cvn_config.calculated_cvn:08X}")
+
         self.print_summary()
 
 
@@ -1195,7 +1611,7 @@ def main():
     print_banner()
 
     parser_args = argparse.ArgumentParser(
-        description='MEDC17 Checksum Analyzer & Corrector v1.0',
+        description='MEDC17 Checksum Analyzer & Corrector v1.1',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Examples:
@@ -1207,6 +1623,9 @@ Examples:
 
   # Correct checksums and overwrite original (use with caution!)
   %(prog)s firmware.bin --correct --overwrite
+
+  # Correct checksums AND CVN to match original file
+  %(prog)s modified.bin --correct --fix-cvn original.bin -o fixed.bin
         '''
     )
 
@@ -1217,6 +1636,8 @@ Examples:
                            help='Output file for corrected binary')
     parser_args.add_argument('--overwrite', action='store_true',
                            help='Overwrite input file with corrections (dangerous!)')
+    parser_args.add_argument('--fix-cvn', metavar='ORIGINAL',
+                           help='Fix CVN to match the CVN from ORIGINAL file')
 
     args = parser_args.parse_args()
 
@@ -1225,24 +1646,95 @@ Examples:
         print_error("Cannot specify both --output and --overwrite")
         sys.exit(1)
 
+    import time
+    start_time = time.time()
+
     try:
         parser = MEDC17BinaryParser(args.binary_file)
         parser.parse()
 
-        # Perform correction if requested
-        if args.correct:
-            output_path = None
-            if args.output:
-                output_path = args.output
-            elif args.overwrite:
-                output_path = args.binary_file
-            else:
-                console.print()
-                print_warning("--correct specified but no output path given")
-                print_info("Use --output <file> or --overwrite to save corrections")
+        # Determine output path
+        output_path = None
+        if args.output:
+            output_path = args.output
+        elif args.overwrite:
+            output_path = args.binary_file
 
-            if output_path:
+        # Perform correction if requested
+        if args.correct or args.fix_cvn:
+            if not output_path:
+                console.print()
+                print_warning("Correction requested but no output path given")
+                print_info("Use --output <file> or --overwrite to save corrections")
+            else:
+                # Load data for corrections
+                corrected_data = bytearray(parser.data)
+
+                # Fix CVN first if requested (before checksums, since CVN patch is within checksum range)
+                if args.fix_cvn:
+                    console.print()
+                    console.print(Panel("[bold cyan]CVN Correction[/bold cyan]",
+                                      border_style="cyan"))
+
+                    # Load original file and get its CVN
+                    if not Path(args.fix_cvn).exists():
+                        print_error(f"Original file not found: {args.fix_cvn}")
+                        sys.exit(1)
+
+                    original_parser = MEDC17BinaryParser(args.fix_cvn)
+                    original_parser.load_binary()
+                    original_parser.find_bosch_blocks()
+                    original_parser.cvn_config = original_parser.find_cvn_config()
+
+                    if original_parser.cvn_config is None:
+                        print_error("Could not find CVN config in original file")
+                        sys.exit(1)
+
+                    target_cvn = original_parser.calculate_cvn()
+                    print_info(f"Target CVN (from original): 0x{target_cvn:08X}")
+
+                    # Calculate current CVN
+                    parser.data = bytes(corrected_data)
+                    current_cvn = parser.calculate_cvn()
+                    print_info(f"Current CVN: 0x{current_cvn:08X}")
+
+                    if current_cvn == target_cvn:
+                        print_success("CVN already matches target")
+                    else:
+                        # Correct CVN
+                        console.print("[yellow]Correcting CVN...[/yellow]")
+                        success = parser.correct_cvn(target_cvn, corrected_data)
+
+                        if not success:
+                            print_error("CVN correction failed")
+                            sys.exit(1)
+
+                        print_success(f"CVN patched for target 0x{target_cvn:08X}")
+
+                # Now correct checksums (handles both --correct and --fix-cvn cases)
+                # CVN patch is within checksum range, so checksums need recalculating
+                parser.data = bytes(corrected_data)
                 parser.correct_all_checksums(output_path)
+
+                # Reload the corrected data
+                with open(output_path, 'rb') as f:
+                    corrected_data = bytearray(f.read())
+
+                # Verify CVN is still correct after checksum fix (if we did CVN correction)
+                if args.fix_cvn:
+                    console.print()
+                    console.print("[dim]Verifying CVN after checksum correction...[/dim]")
+                    parser.data = bytes(corrected_data)
+                    new_cvn = parser.calculate_cvn()
+                    if new_cvn == target_cvn:
+                        print_success(f"CVN verified: 0x{new_cvn:08X}")
+                    else:
+                        print_error(f"CVN verification failed: got 0x{new_cvn:08X}")
+
+        # Print elapsed time
+        elapsed = time.time() - start_time
+        console.print()
+        console.print(f"[dim]Completed in {elapsed:.2f}s[/dim]")
 
     except FileNotFoundError as e:
         print_error(f"File not found: {args.binary_file}, {e}")
