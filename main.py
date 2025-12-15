@@ -416,6 +416,16 @@ class BoschBlock:
     checksum_complement: int
     checksum_structures: List[ChecksumStructure]
 
+    @property
+    def block_type_id(self) -> int:
+        """Get the block type from the first byte of the identifier"""
+        return self.block_identifier & 0xFF
+
+    @property
+    def has_otp(self) -> bool:
+        """Check if this block has OTP (One-Time Programmable) flag set"""
+        return bool(self.block_identifier & 0x00800000)
+
 
 class MEDC17BinaryParser:
     """Parser for MEDC17 ECU binary files (little-endian format)"""
@@ -503,6 +513,8 @@ class MEDC17BinaryParser:
         +0x30: Checksum adjust (dword)
         +0x34: Checksum structures start (32 bytes each)
         Last: Final checksum (dword)
+
+        Returns None if the data at flat_address doesn't look like a valid block.
         """
         if flat_address + 0x40 > len(self.data):
             return None
@@ -512,6 +524,24 @@ class MEDC17BinaryParser:
         size = self.read_dword_le(flat_address + 4)
         block_end = self.read_dword_le(flat_address + 12)
 
+        # Validate block type ID is known
+        block_type_id = block_identifier & 0xFF
+        if block_type_id not in BLOCK_IDENTIFIERS:
+            return None
+
+        # Validate size is reasonable (must fit in file and be > minimum header size)
+        if size < 0x40 or size > len(self.data) or flat_address + size > len(self.data):
+            return None
+
+        # Validate block ends with DEADBEEF marker (little-endian)
+        block_end_offset = flat_address + size - 4
+        if self.read_dword_le(block_end_offset) != 0xDEADBEEF:
+            return None
+
+        # Validate block_end is a valid TriCore flash address
+        if not self._is_flash_addr(block_end):
+            return None
+
         # Software identifier at offset +0x1A (26)
         identifier_length = 10
         sw_identifier = self.data[flat_address + 26:flat_address + 26 + identifier_length]
@@ -519,8 +549,16 @@ class MEDC17BinaryParser:
         # Number of checksum structures at offset +0x2C (26 + 10 + 8)
         num_checksum_structures = self.read_dword_le(flat_address + 26 + identifier_length + 8)
 
+        # Validate number of checksum structures is reasonable
+        if num_checksum_structures > 100:
+            return None
+
         # Calculate block start from block_end and size
         block_start = ((block_end + 5) - size - 1)
+
+        # Validate block_start is a valid TriCore flash address
+        if not self._is_flash_addr(block_start):
+            return None
 
         # Checksum adjust at offset +0x30 (48)
         checksum_adjust = self.read_dword_le(flat_address + 0x30)
@@ -536,7 +574,7 @@ class MEDC17BinaryParser:
         checksum = self.read_dword_le(checksum_offset)
         checksum_complement = (~checksum) & 0xFFFFFFFF
 
-        block_name = BLOCK_IDENTIFIERS.get(block_identifier, f'Unknown (0x{block_identifier:02X})')
+        block_name = BLOCK_IDENTIFIERS.get(block_type_id, f'Unknown (0x{block_type_id:02X})')
 
         return BoschBlock(
             bin_start=flat_address,
@@ -570,13 +608,17 @@ class MEDC17BinaryParser:
         block_count = 0
 
         while current_pos is not None and current_pos < len(self.data):
-            print(f"[+] Reading block {block_count + 1} at 0x{current_pos:X}")
-
             block = self.parse_block(current_pos)
-            if block is None:
-                print(f"[!] Failed to parse block at 0x{current_pos:X}")
-                break
 
+            if block is None:
+                # Not a valid block - silently skip to next non-zero region
+                next_pos = self.find_next_nonzero(current_pos + 1)
+                if next_pos is None or next_pos >= len(self.data):
+                    break
+                current_pos = next_pos
+                continue
+
+            print(f"[+] Found block {block_count + 1} at 0x{current_pos:X}: {block.block_name}")
             self.bosch_blocks.append(block)
             block_count += 1
 
@@ -1535,8 +1577,9 @@ class MEDC17BinaryParser:
         for i, block in enumerate(self.bosch_blocks, 1):
             console.print()
 
-            # Block header
-            header = f"[bold yellow]Block {i}:[/bold yellow] [cyan]{block.block_name}[/cyan]"
+            # Block header with OTP indicator if set
+            otp_indicator = " [red][OTP][/red]" if block.has_otp else ""
+            header = f"[bold yellow]Block {i}:[/bold yellow] [cyan]{block.block_name}[/cyan]{otp_indicator}"
             console.print(header)
 
             # Block info table
@@ -1547,7 +1590,7 @@ class MEDC17BinaryParser:
             info_table.add_row("Location", f"0x{block.bin_start:08X} - 0x{block.bin_end:08X}")
             info_table.add_row("Memory", f"0x{block.block_start:08X} - 0x{block.block_end:08X}")
             info_table.add_row("Size", f"0x{block.size:X} ({block.size:,} bytes)")
-            info_table.add_row("Identifier", f"0x{block.block_identifier:02X}")
+            info_table.add_row("Identifier", f"0x{block.block_identifier:08X} (type: 0x{block.block_type_id:02X})")
 
             console.print(info_table)
 
